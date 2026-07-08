@@ -195,7 +195,7 @@ EXECUTE_QTY_DECIMALS = 2   # rounding for computed share quantities
 MAX_ORDER_GBP = 800.0      # refuse execution if any single order exceeds this
 MAX_RUN_GBP = 2500.0       # refuse execution if a run's total exceeds this
 ORDER_PAUSE = 1.5          # seconds between order placements (50 req/min cap)
-EXTENDED_HOURS = False     # False: orders fill only in the regular US
+EXTENDED_HOURS = True     # False: orders fill only in the regular US
                            # session (14:30-21:00 UK); placed outside it
                            # they queue for the next open. True: orders may
                            # also fill in pre-market/after-hours -- thinner
@@ -798,11 +798,17 @@ def build_report(close, dollar_volume, fx, holdings_gbp, cash_gbp):
 
 
 def print_report(df, weights, cash_target, flags, sector_target, meta, fx,
-                 close, holdings_gbp, cash_gbp, source):
+                 close, holdings_gbp, cash_gbp, source, run_date=None):
     last_date = close.index[-1].date()
+    run_date = run_date or datetime.now().date()
     total = float(sum(holdings_gbp.values()) + cash_gbp)
     print("=" * 78)
-    print(f"Daily signal report | data through {last_date} | GBPUSD = {fx:.4f}")
+    print(f"Daily signal report | run {run_date} | data through {last_date} "
+          f"| GBPUSD = {fx:.4f}")
+    if run_date != last_date:
+        print(f"note: the most recent completed US session is {last_date}; "
+              f"signals use that close (later dates were weekends, US market "
+              f"holidays, or had not closed yet).")
     print(f"Portfolio value used: GBP {total:,.2f} "
           f"(holdings {sum(holdings_gbp.values()):,.2f} + cash {cash_gbp:,.2f})"
           f" | source: {source}")
@@ -879,7 +885,7 @@ def plan_orders(df, last_usd, fx, state):
     return plan
 
 
-def execute_orders(plan, assume_yes=False):
+def execute_orders(plan, assume_yes=False, run_date=None):
     """Place the planned market orders. Safety properties: hard per-order
     and per-run GBP caps; an explicit typed confirmation gate; sells are
     placed first, then cash is re-checked and buys scaled down to fit;
@@ -913,8 +919,8 @@ def execute_orders(plan, assume_yes=False):
 
     import json as _json
     os.makedirs(EXEC_DIR, exist_ok=True)
-    log_path = os.path.join(
-        EXEC_DIR, f"executions_{datetime.now(timezone.utc).date()}.jsonl")
+    run_date = run_date or datetime.now().date()
+    log_path = os.path.join(EXEC_DIR, f"executions_{run_date}.jsonl")
 
     def _log(entry):
         with open(log_path, "a") as fh:
@@ -1142,10 +1148,12 @@ def main():
 
     df, weights, cash_target, flags, sector_target, meta = build_report(
         close, dollar_volume, fx, holdings_gbp, cash_gbp)
+    run_date = datetime.now().date()
+    data_date = close.index[-1].date()
     print_report(df, weights, cash_target, flags, sector_target, meta, fx,
-                 close, holdings_gbp, cash_gbp, source)
+                 close, holdings_gbp, cash_gbp, source, run_date)
     os.makedirs(DAILY_DIR, exist_ok=True)
-    fname = os.path.join(DAILY_DIR, f"signals_{close.index[-1].date()}.csv")
+    fname = os.path.join(DAILY_DIR, f"signals_{run_date}.csv")
     total_val = float(sum(holdings_gbp.values()) + cash_gbp)
     cash_row = pd.DataFrame([{
         "ticker": "CASH", "action": "CASH",
@@ -1155,7 +1163,8 @@ def main():
         "target_gbp": round(cash_target, 2), "trade_gbp": 0.0,
         "fx_fee_gbp": 0.0, "shares": "", "last_usd": "", "mom_z": "",
         "trend": "", "area": "cash",
-        "note": "account cash (recorded for monthly reporting)",
+        "note": f"account cash (recorded for monthly reporting); "
+                f"data as of {data_date}",
     }])
     pd.concat([df, cash_row], ignore_index=True).to_csv(fname, index=False)
     print(f"\nSaved: {fname}")
@@ -1171,7 +1180,7 @@ def main():
             print("\n--execute refused: price data is stale.")
             return
         plan = plan_orders(df, close.iloc[-1], fx, state)
-        execute_orders(plan, assume_yes=args.yes)
+        execute_orders(plan, assume_yes=args.yes, run_date=run_date)
 
 
 if __name__ == "__main__":

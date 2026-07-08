@@ -1,9 +1,0 @@
-ticker,action,current_gbp,target_pct,target_gbp,trade_gbp,fx_fee_gbp,shares,last_usd,mom_z,trend,area,note
-AAOI,SELL,528.85,8.38,385.12,-143.74,0.22,1.3816,139.0,1.87,Y,"networking, optical & hardware",
-ALAB,HOLD,561.51,11.7,537.64,0.0,0.0,,430.86,2.45,Y,semiconductors: design & compute,within 3pp rebalance band
-DELL,HOLD,649.51,13.51,621.22,0.0,0.0,,425.25,1.95,Y,"networking, optical & hardware",within 3pp rebalance band
-INTC,HOLD,614.0,12.7,583.81,0.0,0.0,,127.02,2.29,Y,semiconductors: design & compute,within 3pp rebalance band
-MRVL,HOLD,569.06,11.74,539.6,0.0,0.0,,272.05,1.85,Y,semiconductors: design & compute,within 3pp rebalance band
-MU,HOLD,491.03,11.75,540.09,0.0,0.0,,1032.28,2.82,Y,"semiconductors: equipment, foundry, memory & EDA",within 3pp rebalance band
-SNDK,HOLD,539.45,10.98,504.67,0.0,0.0,,2032.22,8.3,Y,"semiconductors: equipment, foundry, memory & EDA",within 3pp rebalance band
-WDC,HOLD,643.68,14.25,655.09,0.0,0.0,,598.37,2.21,Y,"semiconductors: equipment, foundry, memory & EDA",within 3pp rebalance band
