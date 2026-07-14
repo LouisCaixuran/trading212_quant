@@ -1,9 +1,10 @@
 # Quant signals for a Trading 212 GBP account
 
 A small personal toolkit that produces daily buy/sell signals for a
-tech-focused basket of US-listed shares, optionally places the orders
-through the Trading 212 API, keeps a monthly record, and prepares an
-offline pack you can hand to any LLM for a periodic strategy review.
+multi-sector basket of US-listed shares using a multi-factor rotation,
+optionally places the orders through the Trading 212 API, keeps a monthly
+record, and prepares an offline pack you can hand to any LLM for a
+periodic strategy review.
 
 **This is a mechanical screening tool, not investment advice.** Daily
 rule-based signals on liquid US equities have no demonstrated edge for a
@@ -48,6 +49,7 @@ Python 3.10 or newer.
 
 ```bash
 pip install yfinance pandas numpy      # required for the daily engine
+pip install anthropic                  # NOT needed: the review is offline
 ```
 
 Price data comes from Yahoo Finance through `yfinance`; no key is needed
@@ -86,11 +88,44 @@ python quant_signals.py --execute  # report, then place orders after a typed con
 ```
 
 What the engine does, in order: keep only names above their 200-day
-trend and above a liquidity floor; rank the survivors by a blend of 3-,
-6- and 12-month momentum; hold the top `TOP_N`, capped per name and per
-sector; size by inverse volatility; and keep about 5% in cash. Existing
-positions are only adjusted when they drift more than 3 percentage points
-from target, which limits churn and the FX fee it would cost.
+trend and above a liquidity floor; score every survivor with a
+multi-factor composite (momentum, trend quality, low volatility and
+short-term reversal, each derived from price and volume and blended by
+`FACTOR_WEIGHTS`); hold the top `TOP_N`, capped per name and per sector;
+size by inverse volatility; and keep about 5% in cash. Existing positions
+are only adjusted when they drift more than 3 percentage points from
+target, which limits churn and the FX fee it would cost.
+
+The universe spans roughly 300 US-listed names across about 20 sectors:
+semiconductors, software, cybersecurity, internet, fintech and the rest of
+tech, plus financials, healthcare, consumer staples, consumer
+discretionary (including McDonald's), industrials, energy and
+communication services. Edit the `SECTORS` dictionary to add or remove
+names or whole sectors; a larger universe means longer, more
+rate-limit-prone downloads, so trim it if runs become slow.
+
+The factors are all price-derived, because the strategy section receives
+only price and volume. Fundamental factors (value, quality, size) would
+need a separate, slower, cached data feed and are not included.
+
+**Turnover damping.** Because each round trip costs about 0.30% in FX
+fees, the strategy deliberately resists trading. Four brakes, all in the
+config:
+
+| Setting | Effect |
+|---|---|
+| `EXIT_RANK` (14) | Rank hysteresis. A name must reach the top `TOP_N` to be bought, but a name already held is only sold once it falls past rank 14. This is what stops the "sell A buy B today, sell B buy A tomorrow" cycle at the rank boundary. |
+| `SCORE_SMOOTH_DAYS` (5) | The composite score is averaged over the last five sessions, so one noisy day cannot reshuffle the ranking. |
+| `TREND_EXIT_BAND` (3%) | Entry needs price above the 200-day SMA, but a held name is only dropped once price falls 3% below it, so a name oscillating around its trend line is not traded on every crossing. |
+| `REBALANCE_BAND` (5pp) | An existing position is only resized when its weight drifts more than five percentage points from target. |
+
+Risk gates are not buffered: a held name that fails the liquidity floor,
+or falls below the trend exit band, is dropped at once. The cost of
+damping is lag — the portfolio can hold a name ranked as low as
+`EXIT_RANK` and reacts a few days later to genuine changes. Set
+`EXIT_RANK = TOP_N`, `SCORE_SMOOTH_DAYS = 1` and `TREND_EXIT_BAND = 0.0`
+to restore greedy behaviour. `--backtest` now prints the turnover and
+annual fee drag so you can measure the trade-off yourself.
 
 The report lists each name with a BUY, SELL or HOLD action and the GBP
 amount to trade. Orders are plain market orders placed by GBP value; the
@@ -162,7 +197,7 @@ and never edits the code for you.
 Before pasting a returned section in, you can check it:
 
 ```bash
-python strategy_review.py --check candidate_strategy.py
+python strategy_review.py --check my_new_section.py
 ```
 
 This accepts either raw section code or a ```` ```python-strategy ````

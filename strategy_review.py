@@ -75,12 +75,18 @@ Hard rules:
   reporting, the backtest) must not be changed.
 - A replacement must satisfy the contract stated at the top of that section:
   define every constant the section currently defines (other code reads
-  them), define select_portfolio(close, dollar_volume) with the same return
-  structure (weights: a pandas Series of non-negative target weights over
-  tickers in close.columns excluding BENCHMARK, summing to <= 1.0; diag: a
-  dict with keys mom_z, trend_ok, dist, vol, liq_ok, rank, skipped_area,
+  them), define select_portfolio(close, dollar_volume, held=None) with the
+  same return structure (`held` is an iterable of currently-held tickers, or
+  None; weights: a pandas Series of non-negative target weights over tickers
+  in close.columns excluding BENCHMARK, summing to <= 1.0; diag: a dict with
+  keys mom_z, trend_ok, dist, vol, liq_ok, rank, skipped_area, retained,
   n_ranked, fallback), import only numpy / pandas / math / statistics, and
   perform no file, network, or system access.
+- Turnover matters: each round trip costs about 0.30% in FX fees. The
+  current section damps churn with rank hysteresis (EXIT_RANK), score
+  smoothing (SCORE_SMOOTH_DAYS) and a trend exit band. Do not remove these
+  brakes without a clear reason, and never propose a change that would
+  increase trading frequency without quantifying the added cost.
 - Be conservative. A few months of reports is weak evidence. Prefer NO
   CHANGE over fitting to one period. Any parameter change needs a rationale
   that would have been reasonable before seeing these results.
@@ -172,8 +178,13 @@ assert (w >= -1e-12).all(), "negative weight"
 assert set(w.index) <= set(close.columns), "weight on unknown ticker"
 assert qs.BENCHMARK not in w.index, "benchmark selected"
 for key in ("mom_z", "trend_ok", "dist", "vol", "liq_ok", "rank",
-            "skipped_area", "n_ranked", "fallback"):
+            "skipped_area", "retained", "n_ranked", "fallback"):
     assert key in diag, f"diag missing '{key}'"
+# the held path must work and must damp turnover, not amplify it
+w_held, diag_h = qs.select_portfolio(close, close * vol, held=set(w.index))
+assert float(w_held.sum()) <= 1.0 + 1e-9
+churn = len(set(w_held.index) - set(w.index))
+assert churn <= len(w), "held path returned an unrelated portfolio"
 df, w2, cash_t, flags, sect, meta = qs.build_report(
     close, close * vol, 1.33, {"LITE": 500.0}, 1000.0)
 assert len(df) > 0

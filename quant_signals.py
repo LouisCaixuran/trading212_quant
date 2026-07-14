@@ -9,9 +9,11 @@ Pipeline (all parameters in the CONFIG block below):
                        at least MIN_DOLLAR_VOLUME to be selectable.
   2. Trend filter    : only names trading above their 200-day SMA are eligible
                        (120-day fallback for short histories, e.g. recent IPOs).
-  3. Momentum rank   : blend of 3-month, 6-month and 12-minus-1-month total
-                       returns, cross-sectionally z-scored; the top TOP_N
-                       eligible names are kept.
+  3. Multi-factor    : four price/volume factors -- momentum, trend
+       rank            quality, low volatility and short-term reversal -- are
+                       each z-scored across the universe and blended by
+                       FACTOR_WEIGHTS into one composite; the top TOP_N
+                       eligible names (subject to a per-area cap) are kept.
   4. Sizing          : inverse 63-day realised volatility, capped at MAX_WEIGHT
                        per name, then scaled so CASH_BUFFER (5%) of the
                        portfolio is always kept as cash; any further
@@ -164,17 +166,43 @@ SECTORS = {
     "energy & power tech": [
         "FSLR", "ENPH", "GEV", "OKLO", "SMR",
     ],
+    "financials: banks & capital markets": [
+        "JPM", "BAC", "WFC", "C", "GS", "MS", "SCHW", "BLK", "SPGI", "ICE",
+        "CME", "AXP", "USB", "PNC", "KKR",
+    ],
+    "healthcare: pharma, biotech & devices": [
+        "LLY", "JNJ", "UNH", "MRK", "ABBV", "PFE", "TMO", "ABT", "DHR",
+        "AMGN", "BMY", "GILD", "MDT", "VRTX", "REGN", "BSX",
+    ],
+    "consumer staples": [
+        "PG", "KO", "PEP", "COST", "WMT", "MDLZ", "CL", "MO", "PM", "KMB",
+        "GIS", "KDP",
+    ],
+    "consumer discretionary: retail & restaurants": [
+        "MCD", "SBUX", "NKE", "HD", "LOW", "TGT", "CMG", "ORLY", "AZO",
+        "MAR", "YUM", "TJX", "ROST", "LULU",
+    ],
+    "industrials": [
+        "CAT", "DE", "BA", "HON", "GE", "UNP", "UPS", "RTX", "LMT", "GD",
+        "NOC", "MMM", "EMR", "ETN", "ITW",
+    ],
+    "energy": [
+        "XOM", "CVX", "COP", "SLB", "EOG", "MPC", "PSX", "VLO", "OXY",
+        "WMB", "KMI",
+    ],
+    "communication services": [
+        "DIS", "CMCSA", "T", "VZ", "TMUS", "CHTR", "WBD",
+    ],
 }
 
-# Sector labels for current holdings that are not in the watchlist above.
+# Sector labels for current holdings that are not in the watchlist above
+# (held-only: they can be sold but are not candidates to buy).
 HOLDING_SECTORS = {
     "LITE": "networking, optical & hardware",
     "AAOI": "networking, optical & hardware",
     "MU":   "semiconductors: equipment, foundry, memory & EDA",
     "ORCL": "software platforms & mega-caps",
     "FIG":  "software platforms & mega-caps",
-    "MCD":  "non-tech (held)",
-    "LLY":  "non-tech (held)",
 }
 
 WATCHLIST = sorted({t for names in SECTORS.values() for t in names})
@@ -543,42 +571,177 @@ def fetch_t212_state(fx):
 # replace. Contract for any replacement:
 #   * may import only numpy / pandas / math / statistics
 #   * must define every constant in this section (other code reads them)
-#   * must define select_portfolio(close, dollar_volume) returning
-#     (weights, diag): weights is a pd.Series of non-negative target
-#     weights over tickers in close.columns (excluding BENCHMARK),
-#     summing to <= 1.0; diag is a dict with keys mom_z, trend_ok, dist,
-#     vol, liq_ok (Series), rank (dict), skipped_area (dict),
-#     n_ranked (int), fallback (Series)
+#   * must define select_portfolio(close, dollar_volume, held=None)
+#     returning (weights, diag). `held` is an iterable of tickers currently
+#     held (may be None). weights is a pd.Series of non-negative target
+#     weights over tickers in close.columns (excluding BENCHMARK), summing
+#     to <= 1.0; diag is a dict with keys mom_z, trend_ok, dist, vol,
+#     liq_ok (Series), rank (dict), skipped_area (dict), retained (set),
+#     n_ranked (int), fallback (Series). diag["mom_z"] holds the
+#     multi-factor composite score (not momentum alone); the key name is
+#     kept for compatibility with the rest of the program.
 #   * no I/O, no network access, no reference to the trading/execution code
+#
+# MULTI-FACTOR cross-sectional rotation with TURNOVER DAMPING.
+#
+# Factors (price/volume only -- that is all this section receives; a
+# fundamental factor such as value or quality would need a separate feed):
+#   momentum       -- trailing returns (3m, 6m, 12m-minus-1m).
+#   trend_quality  -- how straight the up-move is (signed R^2 of a
+#                     log-price line fit); rewards steady over jagged.
+#   low_vol        -- lower recent volatility scores higher; also damps
+#                     the most parabolic names.
+#   reversal       -- last month's losers score higher (short-term
+#                     reversal); complements 12m-1m momentum.
+# Each is z-scored across the universe (winsorised) and blended by
+# FACTOR_WEIGHTS into one composite.
+#
+# Turnover damping (four independent brakes, all configurable):
+#   1. SCORE_SMOOTH_DAYS -- the composite is averaged over the last few
+#      days, so one noisy session cannot reshuffle the ranking.
+#   2. EXIT_RANK  -- rank hysteresis / buffer zone. A name must rank in the
+#      top TOP_N to be BOUGHT, but a name already held is only SOLD once it
+#      falls past EXIT_RANK. This is what stops the "sell A buy B today,
+#      sell B buy A tomorrow" cycle at the rank boundary.
+#   3. TREND_EXIT_BAND -- entry needs price above the SMA, but a held name
+#      is only dropped once price falls this far BELOW the SMA, so a name
+#      oscillating around its trend line is not traded on every crossing.
+#   4. REBALANCE_BAND -- an existing position is only resized when its
+#      weight drifts this far from target (used by the report, not here).
+#
+# Risk gates are deliberately NOT buffered: a held name that fails the
+# liquidity floor, or falls below the trend exit band, is dropped at once.
+# The cost of damping is lag: the portfolio can hold a name ranked as low
+# as EXIT_RANK and will react a few days later to genuine changes. Set
+# EXIT_RANK = TOP_N, SCORE_SMOOTH_DAYS = 1 and TREND_EXIT_BAND = 0.0 to
+# restore the previous, greedier behaviour.
 
 TOP_N = 8               # number of names in the target portfolio
+EXIT_RANK = 14          # hysteresis: a held name is sold only once its
+                        # composite rank falls past this (must be >= TOP_N)
 MAX_PER_AREA = 3        # max names from any single area among the picks
-                        # (guards against the whole portfolio chasing one theme)
 MAX_WEIGHT = 0.15       # cap per name (fraction of total portfolio)
-CASH_BUFFER = 0.05      # fraction of the portfolio always kept as cash, to
-                        # absorb price moves, slippage and FX fees between
-                        # signal time and execution
+CASH_BUFFER = 0.05      # fraction of the portfolio always kept as cash
 MIN_TRADE_GBP = 40.0    # ignore entries/exits smaller than this
-REBALANCE_BAND = 0.03   # adjust an existing position only when its weight
-                        # deviates from target by > 3 percentage points
+REBALANCE_BAND = 0.05   # adjust an existing position only when its weight
+                        # deviates from target by > 5 percentage points
 
 MIN_DOLLAR_VOLUME = 20e6  # min 60-day median daily traded value (USD)
 
+# Relative weights of the four factors in the composite. They need not sum
+# to 1; each name is scored on whichever factors it has data for.
+FACTOR_WEIGHTS = {
+    "momentum": 0.40,
+    "trend_quality": 0.20,
+    "low_vol": 0.20,
+    "reversal": 0.20,
+}
+
 TREND_SMA = 200         # main trend filter window (trading days)
 FALLBACK_SMA = 120      # used when a name has < TREND_SMA observations
+TREND_EXIT_BAND = 0.03  # a held name is dropped only once price is this far
+                        # below its SMA (entry still requires price > SMA)
 MOM_WINDOWS = (63, 126)         # 3m and 6m momentum lookbacks
 MOM_LONG = (252, 21)            # 12-month momentum, skipping the last month
-VOL_WINDOW = 63         # realised-volatility window for sizing
+VOL_WINDOW = 63         # realised-volatility window (sizing and low_vol factor)
+REVERSAL_WINDOW = 21    # short-term reversal lookback (1 month)
+TREND_QUALITY_WINDOW = 126      # window for the log-price straightness fit
+SCORE_SMOOTH_DAYS = 5   # average the composite over this many recent days
+WINSOR_Z = 3.0          # clip factor z-scores to +/- this before blending
 
 
 def cross_sectional_z(col: pd.Series) -> pd.Series:
+    """Cross-sectional z-score, winsorised to +/- WINSOR_Z so a single
+    parabolic name cannot dominate a factor."""
     v = col.dropna()
     if len(v) < 3:
         return pd.Series(np.nan, index=col.index)
     s = v.std(ddof=0)
     if not np.isfinite(s) or s == 0:
         return (col - v.mean()) * 0.0
-    return (col - v.mean()) / s
+    return ((col - v.mean()) / s).clip(-WINSOR_Z, WINSOR_Z)
+
+
+# ---------------------------------------------------------------------------
+# Factors (price/volume only)
+# ---------------------------------------------------------------------------
+
+def momentum_factor(close: pd.DataFrame) -> pd.Series:
+    """Blend of 3m, 6m and 12m-minus-1m trailing returns, each z-scored
+    across the universe then averaged."""
+    tail = close.tail(MOM_LONG[0] + MOM_LONG[1] + 2)
+    comps = {}
+    for w in MOM_WINDOWS:
+        comps[f"r{w}"] = (tail / tail.shift(w)).iloc[-1] - 1.0
+    lw, skip = MOM_LONG
+    comps[f"r{lw}_{skip}"] = (tail.shift(skip) / tail.shift(lw)).iloc[-1] - 1.0
+    z = pd.DataFrame(comps).apply(cross_sectional_z, axis=0)
+    return z.mean(axis=1)  # NaN components skipped per name
+
+
+def trend_quality_factor(close: pd.DataFrame, window: int) -> pd.Series:
+    """Signed R^2 of a straight-line fit to log price over `window` days:
+    corr(time, log price) * |corr|. Near +1 = a clean, steady uptrend;
+    near -1 = a clean downtrend; near 0 = choppy."""
+    logp = np.log(close.tail(window))
+    x = pd.Series(np.arange(len(logp), dtype=float), index=logp.index)
+    corr = logp.corrwith(x)          # pairwise-complete per column
+    return corr * corr.abs()
+
+
+def reversal_factor(close: pd.DataFrame, window: int) -> pd.Series:
+    """Negative of the last-month return: recent losers score higher."""
+    tail = close.tail(window + 1)
+    return -((tail / tail.shift(window)).iloc[-1] - 1.0)
+
+
+def annualised_vol(close: pd.DataFrame, window: int) -> pd.Series:
+    tail = close.tail(window + 1)
+    logret = np.log(tail / tail.shift(1))
+    return (logret.rolling(window, min_periods=max(5, window // 2))
+                  .std().iloc[-1] * np.sqrt(252.0))
+
+
+def composite_score(close: pd.DataFrame, vol: pd.Series):
+    """Blend the four factors into one score per name. Returns
+    (composite, factor_z_frame)."""
+    raw = {
+        "momentum": momentum_factor(close),
+        "trend_quality": trend_quality_factor(close, TREND_QUALITY_WINDOW),
+        "low_vol": -vol,
+        "reversal": reversal_factor(close, REVERSAL_WINDOW),
+    }
+    zf = pd.DataFrame({k: cross_sectional_z(pd.Series(v).reindex(close.columns))
+                       for k, v in raw.items()})
+    wser = pd.Series(FACTOR_WEIGHTS)
+    mask = zf.notna()
+    wmat = mask.mul(wser, axis=1)                 # weight only where present
+    denom = wmat.sum(axis=1).replace(0.0, np.nan)
+    composite = (zf.fillna(0.0) * wmat).sum(axis=1) / denom
+    return composite, zf
+
+
+def smoothed_composite(close: pd.DataFrame, days: int):
+    """Average the composite over the last `days` sessions, so a single
+    noisy close cannot reshuffle the ranking. Uses only past data (each
+    slice ends on an earlier bar), so there is no look-ahead.
+    Returns (mean_composite, latest_factor_frame)."""
+    days = max(1, int(days))
+    scores, latest_zf = [], None
+    for i in range(days):
+        if len(close) - i < 30:
+            break
+        sub = close.iloc[: len(close) - i]
+        comp, zf = composite_score(sub, annualised_vol(sub, VOL_WINDOW))
+        scores.append(comp)
+        if latest_zf is None:
+            latest_zf = zf
+    if not scores:
+        empty = pd.Series(np.nan, index=close.columns)
+        return empty, pd.DataFrame(index=close.columns,
+                                   columns=list(FACTOR_WEIGHTS))
+    return pd.concat(scores, axis=1).mean(axis=1), latest_zf
+
 
 # ---------------------------------------------------------------------------
 # Portfolio construction
@@ -603,10 +766,17 @@ def capped_inverse_vol(vol: pd.Series, cap: float) -> pd.Series:
     return w.clip(upper=cap)
 
 
-def select_portfolio(close: pd.DataFrame, dollar_volume: pd.DataFrame | None):
-    """Apply liquidity floor -> trend filter -> momentum ranking ->
-    inverse-vol sizing to the data as of the last row of `close`.
+def select_portfolio(close: pd.DataFrame, dollar_volume: pd.DataFrame | None,
+                     held=None):
+    """Liquidity floor -> trend filter (with an exit band for held names)
+    -> smoothed multi-factor ranking -> rank hysteresis -> per-area cap ->
+    inverse-vol sizing, as of the last row of `close`.
+
+    `held` is the set of tickers currently in the account; passing it lets
+    incumbents be kept until they fall past EXIT_RANK, which is what damps
+    turnover. With held=None the selection is greedy (previous behaviour).
     Returns (weights, diagnostics)."""
+    held = set(held or ())
     last = close.iloc[-1]
     obs = close.notna().sum()
 
@@ -621,38 +791,53 @@ def select_portfolio(close: pd.DataFrame, dollar_volume: pd.DataFrame | None):
     sma_fb = close.rolling(FALLBACK_SMA, min_periods=FALLBACK_SMA).mean().iloc[-1]
     use_fb = sma_main.isna() & (obs >= FALLBACK_SMA)
     sma_used = sma_main.where(~use_fb, sma_fb)
-    trend_ok = (last > sma_used).fillna(False)
+    trend_ok = (last > sma_used).fillna(False)                    # entry test
+    trend_hold_ok = (last > sma_used * (1.0 - TREND_EXIT_BAND)).fillna(False)
     dist = last / sma_used - 1.0
 
-    comps = {}
-    for w in MOM_WINDOWS:
-        comps[f"r{w}"] = (close / close.shift(w)).iloc[-1] - 1.0
-    lw, skip = MOM_LONG
-    comps[f"r{lw}_{skip}"] = (close.shift(skip) / close.shift(lw)).iloc[-1] - 1.0
-    comp_df = pd.DataFrame(comps)
-    z = comp_df.apply(cross_sectional_z, axis=0)
-    mom_z = z.mean(axis=1)  # NaN components are skipped per name
+    vol = annualised_vol(close, VOL_WINDOW)
+    composite, factor_z = smoothed_composite(close, SCORE_SMOOTH_DAYS)
 
-    logret = np.log(close / close.shift(1))
-    vol = (logret.rolling(VOL_WINDOW, min_periods=VOL_WINDOW // 2)
-                 .std().iloc[-1] * np.sqrt(252.0))
+    def eligible(t):
+        if t == BENCHMARK or not bool(liq_ok.get(t, False)):
+            return False
+        if not np.isfinite(composite.get(t, np.nan)):
+            return False
+        # held names get the wider trend band; new entries the strict test
+        return bool(trend_hold_ok.get(t, False) if t in held
+                    else trend_ok.get(t, False))
 
-    selectable = [t for t in close.columns
-                  if t != BENCHMARK
-                  and bool(liq_ok.get(t, False))
-                  and bool(trend_ok.get(t, False))
-                  and np.isfinite(mom_z.get(t, np.nan))]
-    ranked = sorted(selectable, key=lambda t: float(mom_z[t]), reverse=True)
-    picks, area_count, skipped_area = [], {}, {}
-    for t in ranked:
+    ranked = sorted((t for t in close.columns if eligible(t)),
+                    key=lambda t: float(composite[t]), reverse=True)
+    rank_of = {t: i + 1 for i, t in enumerate(ranked)}
+
+    picks, area_count, skipped_area, retained = [], {}, {}, set()
+
+    def try_add(t, is_retained):
         a = SECTOR_OF.get(t, "other")
         if area_count.get(a, 0) >= MAX_PER_AREA:
             skipped_area[t] = a
-            continue
+            return
         picks.append(t)
         area_count[a] = area_count.get(a, 0) + 1
-        if len(picks) == TOP_N:
+        if is_retained:
+            retained.add(t)
+
+    # pass 1: keep incumbents that are still within the exit buffer
+    exit_rank = max(EXIT_RANK, TOP_N)
+    for t in ranked:
+        if len(picks) >= TOP_N:
             break
+        if t in held and rank_of[t] <= exit_rank:
+            try_add(t, True)
+
+    # pass 2: fill the remaining slots with the best non-held names
+    for t in ranked:
+        if len(picks) >= TOP_N:
+            break
+        if t in held or t in picks:
+            continue
+        try_add(t, False)
 
     if picks:
         v = vol[picks].copy()
@@ -662,10 +847,9 @@ def select_portfolio(close: pd.DataFrame, dollar_volume: pd.DataFrame | None):
         weights = pd.Series(dtype=float)
 
     diag = {
-        "mom_z": mom_z, "trend_ok": trend_ok, "dist": dist, "vol": vol,
-        "liq_ok": liq_ok,
-        "rank": {t: i + 1 for i, t in enumerate(ranked)},
-        "skipped_area": skipped_area,
+        "mom_z": composite, "trend_ok": trend_ok, "dist": dist, "vol": vol,
+        "liq_ok": liq_ok, "factors": factor_z, "retained": retained,
+        "rank": rank_of, "skipped_area": skipped_area,
         "n_ranked": len(ranked), "fallback": use_fb,
     }
     return weights, diag
@@ -677,7 +861,9 @@ def select_portfolio(close: pd.DataFrame, dollar_volume: pd.DataFrame | None):
 # ---------------------------------------------------------------------------
 
 def build_report(close, dollar_volume, fx, holdings_gbp, cash_gbp):
-    weights, diag = select_portfolio(close, dollar_volume)
+    # pass current holdings so the rank-hysteresis buffer can retain them
+    weights, diag = select_portfolio(close, dollar_volume,
+                                     held=set(holdings_gbp))
     last = close.iloc[-1]
     total = float(sum(holdings_gbp.values()) + cash_gbp)
 
@@ -733,9 +919,17 @@ def build_report(close, dollar_volume, fx, holdings_gbp, cash_gbp):
                 notes.append(f"area cap: already {MAX_PER_AREA} picks in "
                              f"'{diag['skipped_area'][t]}'")
             elif t in diag["rank"]:
-                notes.append(f"momentum rank {diag['rank'][t]}/{diag['n_ranked']}")
+                notes.append(f"composite rank {diag['rank'][t]}/"
+                             f"{diag['n_ranked']} (past exit rank {EXIT_RANK})")
             else:
-                notes.append("insufficient history for momentum")
+                notes.append("insufficient history for scoring")
+        r = diag["rank"].get(t)
+        if t in diag.get("retained", set()) and r and r > TOP_N:
+            notes.append(f"kept: rank {r} still inside exit buffer {EXIT_RANK}")
+        if (t in diag.get("retained", set())
+                and not diag["trend_ok"].get(t, False)):
+            notes.append(f"below SMA but inside the "
+                         f"{100 * TREND_EXIT_BAND:.0f}% trend exit band")
         if bool(diag["fallback"].get(t, False)):
             notes.append(f"short history: {FALLBACK_SMA}d SMA used")
         if reason:
@@ -750,7 +944,7 @@ def build_report(close, dollar_volume, fx, holdings_gbp, cash_gbp):
             "fx_fee_gbp": round(fee, 2),
             "shares": round(shares, 4) if np.isfinite(shares) else "",
             "last_usd": round(price, 2) if np.isfinite(price) else "",
-            "mom_z": round(mz, 2) if np.isfinite(mz) else "",
+            "score": round(mz, 2) if np.isfinite(mz) else "",
             "trend": "Y" if diag["trend_ok"].get(t, False) else "N",
             "area": SECTOR_OF.get(t, "other"),
             "note": "; ".join(notes),
@@ -1023,15 +1217,19 @@ def run_backtest(close, dollar_volume):
     t = warm
     prev = pd.Series(dtype=float)
     eq, ew, bm, dts = [1.0], [1.0], [1.0], [idx[t]]
+    turnovers, names_changed = [], []
 
     while t < len(idx) - 1:
         dv = dollar_volume.iloc[: t + 1] if dollar_volume is not None else None
-        w, _ = select_portfolio(close.iloc[: t + 1], dv)
+        w, _ = select_portfolio(close.iloc[: t + 1], dv,
+                                held=set(prev.index))
         nxt = min(t + REBALANCE_EVERY, len(idx) - 1)
         pr = close.iloc[nxt] / close.iloc[t] - 1.0
 
         gross = float((w * pr.reindex(w.index)).fillna(0.0).sum()) if len(w) else 0.0
         turnover = float(w.subtract(prev, fill_value=0.0).abs().sum())
+        turnovers.append(turnover)
+        names_changed.append(len(set(w.index) ^ set(prev.index)))
         eq.append(eq[-1] * (1.0 + gross - turnover * COST_BPS_PER_SIDE / 1e4))
 
         ew.append(ew[-1] * (1.0 + float(pr[uni].mean())))
@@ -1065,6 +1263,12 @@ def run_backtest(close, dollar_volume):
         c, v, s, d = stats(series)
         print(f"{name:24s}  CAGR {c:7.2%}  vol {v:6.2%}  "
               f"Sharpe {s:5.2f}  maxDD {d:6.2%}")
+    if turnovers:
+        per_reb = float(np.mean(turnovers))
+        print(f"\nTurnover: {per_reb:.1%} of the book per rebalance "
+              f"(~{per_reb * per_year:.1%}/yr), "
+              f"{np.mean(names_changed):.1f} names changed per rebalance; "
+              f"cost {per_reb * per_year * COST_BPS_PER_SIDE / 1e4:.2%}/yr in fees.")
     print("\nCaveats: survivorship/selection bias (watchlist chosen with"
           "\nhindsight), no dividends withheld/taxes, coarse cost model, and"
           "\nnames are dropped from returns while their data is missing."
@@ -1161,7 +1365,7 @@ def main():
         "target_pct": (round(100 * cash_target / total_val, 2)
                        if total_val else 0.0),
         "target_gbp": round(cash_target, 2), "trade_gbp": 0.0,
-        "fx_fee_gbp": 0.0, "shares": "", "last_usd": "", "mom_z": "",
+        "fx_fee_gbp": 0.0, "shares": "", "last_usd": "", "score": "",
         "trend": "", "area": "cash",
         "note": f"account cash (recorded for monthly reporting); "
                 f"data as of {data_date}",
